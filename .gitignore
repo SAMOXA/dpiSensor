@@ -27,3 +27,16 @@
 *.i*86
 *.x86_64
 *.hex
+
+.*.cmd
+.*.flags
+*.mod.c
+*.order
+.*.*.cmd
+*~
+*.*~
+TODO.*
+.tmp*
+.tmp_versions
+*.ko
+*.symvers
