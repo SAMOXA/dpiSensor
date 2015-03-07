@@ -76,9 +76,9 @@ static rx_handler_result_t handle_frame( struct sk_buff **pskb ) {
       if( i < sizeof( body->ar_tip ) )
          return RX_HANDLER_PASS; 
    }
-   else           // не ARP и не IP4
-   	  DBG( "rx: injecting frame (RX_HANDLER_PASS) from %s to %s", skb->dev->name, child->name );
-      return RX_HANDLER_PASS; 
+   else  {         // не ARP и не IP4
+      return RX_HANDLER_PASS;
+   } 
    stats.rx_packets++;
    stats.rx_bytes += skb->len;
    DBG( "rx: injecting frame from %s to %s", skb->dev->name, child->name );
@@ -103,12 +103,12 @@ static netdev_tx_t start_xmit( struct sk_buff *skb, struct net_device *dev ) {
 static int open( struct net_device *dev ) {
    struct in_device *in_dev = dev->ip_ptr;
    struct in_ifaddr *ifa = in_dev->ifa_list;      /* IP ifaddr chain */
-   char sdebg[ 40 ] = "";
+   //char sdebg[ 40 ] = "";
    LOG( "%s: device opened", dev->name );
    child_ip = ifa->ifa_address;
-   sprintf( sdebg, "%s:", strIP( ifa->ifa_address ) );
-   strcat( sdebg, strIP( ifa->ifa_mask ) );
-   DBG( "%s: %s", dev->name, sdebg );
+   //sprintf( sdebg, "%s:", strIP( ifa->ifa_address ) );
+   //strcat( sdebg, strIP( ifa->ifa_mask ) );
+   //DBG( "ololo %s: %s", dev->name, sdebg );
    netif_start_queue( dev );
    return 0;
 }
@@ -167,7 +167,12 @@ int __init init( void ) {
    }
    register_netdev( child );
    rtnl_lock();
-   netdev_rx_handler_register( priv->parent, &handle_frame, NULL );
+   dev_set_promiscuity(priv->parent, 1);
+   if(netdev_rx_handler_register( priv->parent, &handle_frame, NULL ) < 0){
+      ERR( "%s: rx_handler_register, error %i", THIS_MODULE->name, err );
+      rtnl_unlock();
+      err = -EBUSY; goto err;
+   }
    rtnl_unlock();
    LOG( "module %s loaded", THIS_MODULE->name );
    LOG( "%s: create link %s", THIS_MODULE->name, child->name );
