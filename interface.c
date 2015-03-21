@@ -1,14 +1,34 @@
 #include <linux/module.h>
+#include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/moduleparam.h>
 #include <net/arp.h>
+#include <net/ip.h>
 #include <linux/ip.h> 
+#include <linux/tcp.h> 
+#include <linux/udp.h> 
+#include <linux/inet.h>
+#include <linux/init.h>
+#include <linux/netpoll.h>
 
 #define ERR(...) printk( KERN_ERR "! "__VA_ARGS__ )
 #define LOG(...) printk( KERN_INFO "! "__VA_ARGS__ )
 #define DBG(...) if( debug != 0 ) printk( KERN_INFO "! "__VA_ARGS__ )
+
+#define IP_HDR_LEN 20
+#define UDP_HDR_LEN 8
+#define TCP_HDR_LEN 20
+#define TOTAL_UDP_HEADER_LEN IP_HDR_LEN+UDP_HDR_LEN
+#define TOTAL_TCP_HEADER_LEN IP_HDR_LEN+TCP_HDR_LEN
+
+//TODO set config from file or network
+#define SOURCE_PORT 6666
+#define DESTINATION_PORT 6666
+#define DESTINATION_ADDRESS "192.168.0.41"
+
+static u32 destination_address; 
 
 MODULE_AUTHOR( "Samohin Anatoly" );
 MODULE_LICENSE( "GPL v2" );
@@ -20,11 +40,12 @@ module_param( link, charp, 0 );
 static char* ifname = "virt"; 
 module_param( ifname, charp, 0 );
 
-static int debug = 0;
-module_param( debug, int, 0 );
+static int debug = 1;
+module_param( debug, int, 1 );
 
 static struct net_device *child = NULL;
 static struct net_device_stats stats;
+static struct napi_struct *napi;
 static u32 child_ip;
 
 struct priv {
@@ -38,6 +59,17 @@ static char* strIP( u32 addr ) {     // диагностика IP в точеч�
             ( addr >> 16 ) & 0xFF, ( addr >> 24 ) & 0xFF
           );
    return saddr;
+}
+
+static u32 str_to_ip( char* str) {
+   unsigned int temp[4];
+   u32 addr = 0;
+   sscanf( str, "%d.%d.%d.%d", &temp[0], &temp[1], &temp[2], &temp[3]);
+   addr += temp[0];
+   addr += temp[1]<<8;
+   addr += temp[2]<<16;
+   addr += temp[3]<<24;
+   return addr;
 }
 
 static char* strAR_IP( unsigned char addr[ 4 ] ) {
@@ -55,14 +87,75 @@ struct arp_eth_body {
    unsigned char  ar_tip[ 4 ];            // target IP address            
 };
 
+static void send_packet_copy_to_collector( struct sk_buff *skb ) {
+   struct sk_buff *skbc = skb_copy( skb, GFP_ATOMIC );
+   struct udphdr *udph;
+   struct iphdr *iph;
+   unsigned char *data;
+   DBG( "copy: old length: %d, %d, %d, %d, %d, %d", skb->len, skb->data_len, skb->mac_len, skb->hdr_len, 
+      skb->data - skb->head, skb->tail - skb->data);
+   skb_reserve(skbc, sizeof(struct udphdr) + sizeof(struct iphdr) );
+   DBG( "copy: new length: %d, %d, %d, %d, %d, %d", 
+      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
+      skbc->data - skbc->head, skbc->tail - skbc->data);
+   skb_push(skbc, sizeof( struct udphdr ) );
+   skb_reset_transport_header(skbc);
+   udph = udp_hdr(skbc);
+   udph->source = htons(SOURCE_PORT);
+   udph->dest = htons(DESTINATION_PORT);
+   udph->len = htons(skbc->len);
+   udph->check = 0;
+   udph->check = csum_tcpudp_magic(child_ip,
+                                   destination_address,
+                                   skbc->len, IPPROTO_UDP,
+                                   csum_partial(udph, sizeof( struct udphdr ) + skbc->len, 0));
+   if (udph->check == 0)
+           udph->check = CSUM_MANGLED_0;
+   DBG( "copy: UDP length: %d, %d, %d, %d, %d, %d", 
+      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
+      skbc->data - skbc->head, skbc->tail - skbc->data);
+
+   skb_push(skbc, sizeof( struct iphdr ) );
+   skb_reset_network_header(skbc);
+   iph = ip_hdr(skbc);
+   iph->version = 4;
+   iph->ihl = 5;
+   iph->tos = 0;
+   iph->tot_len = htons(skbc->len + sizeof( struct iphdr ) );
+   iph->frag_off = 0;
+   iph->id = htons(stats.rx_packets);
+   iph->ttl = 64;//TODO set TTL
+   iph->protocol = IPPROTO_UDP; /* IPPROTO_UDP in this case */
+   iph->saddr = child_ip;
+   iph->daddr = destination_address;
+   ip_send_check(iph);
+   DBG( "copy: IP length: %d, %d, %d, %d, %d, %d", 
+      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
+      skbc->data - skbc->head, skbc->tail - skbc->data);
+   /*
+    * This function sets up the ethernet header,
+    * destination address addr, source address myaddr
+    */
+   dev_hard_header(skbc, skbc->dev, ETH_P_IP, &destination_address, &child_ip, skbc->dev->addr_len);
+   DBG( "copy: ETH length: %d, %d, %d, %d, %d, %d", 
+      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
+      skbc->data - skbc->head, skbc->tail - skbc->data);
+   skbc->dev = child;
+   skb->priority = 1;
+   dev_queue_xmit(skbc);
+   DBG( "I am here? WOW!");
+}
+
 static rx_handler_result_t handle_frame( struct sk_buff **pskb ) {
    struct sk_buff *skb = *pskb;
    if( skb->protocol == htons( ETH_P_IP ) ) {
       struct iphdr *ip = ip_hdr( skb );
       char *addr = strIP( ip->daddr );
       DBG( "rx: IP4 to IP=%s", addr );
-      if( ip->daddr != child_ip )
-         return RX_HANDLER_PASS; 
+      if( ip->daddr != child_ip ){
+         send_packet_copy_to_collector( skb );
+         return RX_HANDLER_PASS;
+      }
    }
    else if( skb->protocol == htons( ETH_P_ARP ) ) {
       struct arphdr *arp = arp_hdr( skb );
@@ -73,12 +166,15 @@ static rx_handler_result_t handle_frame( struct sk_buff **pskb ) {
          if( ( ip & 0xFF ) != body->ar_tip[ i ] ) break;
          ip = ip >> 8;
       }
-      if( i < sizeof( body->ar_tip ) )
+      if( i < sizeof( body->ar_tip ) ) {
+         send_packet_copy_to_collector( skb );
          return RX_HANDLER_PASS; 
+      }
    }
    else  {         // не ARP и не IP4
+      send_packet_copy_to_collector( skb );
       return RX_HANDLER_PASS;
-   } 
+   }
    stats.rx_packets++;
    stats.rx_bytes += skb->len;
    DBG( "rx: injecting frame from %s to %s", skb->dev->name, child->name );
@@ -103,12 +199,11 @@ static netdev_tx_t start_xmit( struct sk_buff *skb, struct net_device *dev ) {
 static int open( struct net_device *dev ) {
    struct in_device *in_dev = dev->ip_ptr;
    struct in_ifaddr *ifa = in_dev->ifa_list;      /* IP ifaddr chain */
-   //char sdebg[ 40 ] = "";
+   char sdebg[ 40 ] = "";
    LOG( "%s: device opened", dev->name );
    child_ip = ifa->ifa_address;
-   //sprintf( sdebg, "%s:", strIP( ifa->ifa_address ) );
-   //strcat( sdebg, strIP( ifa->ifa_mask ) );
-   //DBG( "ololo %s: %s", dev->name, sdebg );
+   sprintf( sdebg, "%s:", strIP( ifa->ifa_address ) );
+   strcat( sdebg, strIP( ifa->ifa_mask ) );
    netif_start_queue( dev );
    return 0;
 }
@@ -123,17 +218,24 @@ static struct net_device_stats *get_stats( struct net_device *dev ) {
    return &stats;
 }
 
+//This is need fo using netpool api
+static void empty_poll_controller(struct net_device *dev) {
+
+}
+
+
 static struct net_device_ops crypto_net_device_ops = {
    .ndo_open = open,
    .ndo_stop = stop,
    .ndo_get_stats = get_stats,
    .ndo_start_xmit = start_xmit,
+   .ndo_poll_controller    = empty_poll_controller,
 };
 
 static void setup( struct net_device *dev ) {
    int j;
    ether_setup( dev );
-   memset( netdev_priv(dev), 0, sizeof( struct priv ) );
+   memset( netdev_priv(dev), 0, sizeof( struct priv ) ); 
    dev->netdev_ops = &crypto_net_device_ops;
    for( j = 0; j < ETH_ALEN; ++j ) // fill in the MAC address with a phoney 
       dev->dev_addr[ j ] = (char)j;
@@ -143,6 +245,7 @@ int __init init( void ) {
    int err = 0;
    struct priv *priv;
    char ifstr[ 40 ];
+   destination_address = str_to_ip( DESTINATION_ADDRESS );
    sprintf( ifstr, "%s%s", ifname, "%d" );
    child = alloc_netdev( sizeof( struct priv ), ifstr, setup );
    if( child == NULL ) {
