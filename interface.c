@@ -26,16 +26,20 @@
 //TODO set config from file or network
 #define SOURCE_PORT 6666
 #define DESTINATION_PORT 6666
-#define DESTINATION_ADDRESS "192.168.0.41"
+#define DESTINATION_ADDRESS "192.168.1.129"
+static unsigned char destination_mac[6] = {36, 253, 82, 189, 143, 250};
 
 static u32 destination_address; 
 
 MODULE_AUTHOR( "Samohin Anatoly" );
 MODULE_LICENSE( "GPL v2" );
-MODULE_VERSION( "0.2" );
+MODULE_VERSION( "0.3" );
 
-static char* link = "eth1";
+static char* link = "eth0";
 module_param( link, charp, 0 );
+
+static char* output_dev = "eth1";
+module_param( output_dev, charp, 0 );
 
 static char* ifname = "virt"; 
 module_param( ifname, charp, 0 );
@@ -45,11 +49,11 @@ module_param( debug, int, 1 );
 
 static struct net_device *child = NULL;
 static struct net_device_stats stats;
-static struct napi_struct *napi;
 static u32 child_ip;
 
 struct priv {
    struct net_device *parent;
+   struct net_device *output;
 };
 
 static char* strIP( u32 addr ) {     // диагностика IP в точечной нотации
@@ -91,13 +95,10 @@ static void send_packet_copy_to_collector( struct sk_buff *skb ) {
    struct sk_buff *skbc = skb_copy( skb, GFP_ATOMIC );
    struct udphdr *udph;
    struct iphdr *iph;
-   unsigned char *data;
-   DBG( "copy: old length: %d, %d, %d, %d, %d, %d", skb->len, skb->data_len, skb->mac_len, skb->hdr_len, 
-      skb->data - skb->head, skb->tail - skb->data);
+   struct ethhdr *eth;
+   struct priv *priv;
+   priv = netdev_priv( child );
    skb_reserve(skbc, sizeof(struct udphdr) + sizeof(struct iphdr) );
-   DBG( "copy: new length: %d, %d, %d, %d, %d, %d", 
-      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
-      skbc->data - skbc->head, skbc->tail - skbc->data);
    skb_push(skbc, sizeof( struct udphdr ) );
    skb_reset_transport_header(skbc);
    udph = udp_hdr(skbc);
@@ -111,10 +112,6 @@ static void send_packet_copy_to_collector( struct sk_buff *skb ) {
                                    csum_partial(udph, sizeof( struct udphdr ) + skbc->len, 0));
    if (udph->check == 0)
            udph->check = CSUM_MANGLED_0;
-   DBG( "copy: UDP length: %d, %d, %d, %d, %d, %d", 
-      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
-      skbc->data - skbc->head, skbc->tail - skbc->data);
-
    skb_push(skbc, sizeof( struct iphdr ) );
    skb_reset_network_header(skbc);
    iph = ip_hdr(skbc);
@@ -129,21 +126,15 @@ static void send_packet_copy_to_collector( struct sk_buff *skb ) {
    iph->saddr = child_ip;
    iph->daddr = destination_address;
    ip_send_check(iph);
-   DBG( "copy: IP length: %d, %d, %d, %d, %d, %d", 
-      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
-      skbc->data - skbc->head, skbc->tail - skbc->data);
-   /*
-    * This function sets up the ethernet header,
-    * destination address addr, source address myaddr
-    */
-   dev_hard_header(skbc, skbc->dev, ETH_P_IP, &destination_address, &child_ip, skbc->dev->addr_len);
-   DBG( "copy: ETH length: %d, %d, %d, %d, %d, %d", 
-      skbc->len, skbc->data_len, skbc->mac_len, skbc->hdr_len,
-      skbc->data - skbc->head, skbc->tail - skbc->data);
-   skbc->dev = child;
+   skb_push(skbc, ETH_HLEN);
+   eth = eth_hdr(skbc);
+   skb_reset_mac_header(skbc);
+   skbc->protocol = eth->h_proto = htons(ETH_P_IP);
+   memcpy(eth->h_source, child->dev_addr, ETH_ALEN);
+   memcpy(eth->h_dest, destination_mac, ETH_ALEN);
+   skbc->dev = priv->output;
    skb->priority = 1;
    dev_queue_xmit(skbc);
-   DBG( "I am here? WOW!");
 }
 
 static rx_handler_result_t handle_frame( struct sk_buff **pskb ) {
@@ -218,18 +209,11 @@ static struct net_device_stats *get_stats( struct net_device *dev ) {
    return &stats;
 }
 
-//This is need fo using netpool api
-static void empty_poll_controller(struct net_device *dev) {
-
-}
-
-
 static struct net_device_ops crypto_net_device_ops = {
    .ndo_open = open,
    .ndo_stop = stop,
    .ndo_get_stats = get_stats,
    .ndo_start_xmit = start_xmit,
-   .ndo_poll_controller    = empty_poll_controller,
 };
 
 static void setup( struct net_device *dev ) {
@@ -259,6 +243,15 @@ int __init init( void ) {
    }
    if( priv->parent->type != ARPHRD_ETHER && priv->parent->type != ARPHRD_LOOPBACK ) {
       ERR( "%s: illegal net type", THIS_MODULE->name );
+      err = -EINVAL; goto err;
+   }
+   priv->output = __dev_get_by_name( &init_net, output_dev ); // output interface  
+   if( !priv->output ) {
+      ERR( "%s: no such output net: %s", THIS_MODULE->name, output_dev );
+      err = -ENODEV; goto err;
+   }
+   if( priv->parent->type != ARPHRD_ETHER && priv->parent->type != ARPHRD_LOOPBACK ) {
+      ERR( "%s: illegal output net type", THIS_MODULE->name );
       err = -EINVAL; goto err;
    }
    /* also, and clone its IP, MAC and other information */
