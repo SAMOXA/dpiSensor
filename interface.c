@@ -12,6 +12,7 @@
 #include <linux/inet.h>
 #include <linux/init.h>
 #include <linux/netpoll.h>
+#include <linux/interrupt.h>
 
 #define ERR(...) printk( KERN_ERR "! "__VA_ARGS__ )
 #define LOG(...) printk( KERN_INFO "! "__VA_ARGS__ )
@@ -92,49 +93,82 @@ struct arp_eth_body {
 };
 
 static void send_packet_copy_to_collector( struct sk_buff *skb ) {
-   struct sk_buff *skbc = skb_copy( skb, GFP_ATOMIC );
+   struct sk_buff *skbc;
    struct udphdr *udph;
    struct iphdr *iph;
    struct ethhdr *eth;
    struct priv *priv;
+   char *payload = skb->data;
+   int err = 0;
+   int length = skb->len;
+   int total_len, ip_len, udp_len;
+   unsigned long flags;
+   static atomic_t ip_ident;
+   struct netdev_queue *txq;
+   const struct net_device_ops *ops;
    priv = netdev_priv( child );
-   skb_reserve(skbc, sizeof(struct udphdr) + sizeof(struct iphdr) );
+   ops = priv->output->netdev_ops;
+   udp_len = length + sizeof(*udph);
+   ip_len = udp_len + sizeof(*iph);
+   total_len = ip_len + LL_RESERVED_SPACE(priv->output);
+   skbc = alloc_skb(total_len + child->needed_tailroom, GFP_ATOMIC);
+   if(!skbc){
+      return;
+   }
+   atomic_set(&skbc->users, 1);
+   skb_reserve(skbc, total_len - length);
+   skb_copy_to_linear_data(skbc, payload, length);
+   skb_put(skbc, length);
+
    skb_push(skbc, sizeof( struct udphdr ) );
    skb_reset_transport_header(skbc);
    udph = udp_hdr(skbc);
    udph->source = htons(SOURCE_PORT);
    udph->dest = htons(DESTINATION_PORT);
-   udph->len = htons(skbc->len);
+   udph->len = htons(udp_len);
    udph->check = 0;
    udph->check = csum_tcpudp_magic(child_ip,
                                    destination_address,
-                                   skbc->len, IPPROTO_UDP,
-                                   csum_partial(udph, sizeof( struct udphdr ) + skbc->len, 0));
+                                   udp_len, IPPROTO_UDP,
+                                   csum_partial(udph, udp_len, 0));
    if (udph->check == 0)
            udph->check = CSUM_MANGLED_0;
    skb_push(skbc, sizeof( struct iphdr ) );
    skb_reset_network_header(skbc);
    iph = ip_hdr(skbc);
-   iph->version = 4;
-   iph->ihl = 5;
-   iph->tos = 0;
-   iph->tot_len = htons(skbc->len + sizeof( struct iphdr ) );
+   /* iph->version = 4; iph->ihl = 5; */
+   put_unaligned(0x45, (unsigned char *)iph);
+   iph->tos      = 0;
+   iph->tot_len  = length + sizeof(*iph);
+   put_unaligned(htons(ip_len), &(iph->tot_len));
+   iph->id       = htons(atomic_inc_return(&ip_ident));
    iph->frag_off = 0;
-   iph->id = htons(stats.rx_packets);
-   iph->ttl = 64;//TODO set TTL
+   iph->ttl      = 64;//TODO set TTL
    iph->protocol = IPPROTO_UDP; /* IPPROTO_UDP in this case */
-   iph->saddr = child_ip;
-   iph->daddr = destination_address;
-   ip_send_check(iph);
-   skb_push(skbc, ETH_HLEN);
-   eth = eth_hdr(skbc);
+   iph->check    = 0;
+   put_unaligned(child_ip, &(iph->saddr));
+   put_unaligned(destination_address, &(iph->daddr));
+   iph->check    = ip_fast_csum((unsigned char *)iph, iph->ihl);
+   eth = (struct ethhdr *) skb_push(skbc, ETH_HLEN);
    skb_reset_mac_header(skbc);
    skbc->protocol = eth->h_proto = htons(ETH_P_IP);
-   memcpy(eth->h_source, child->dev_addr, ETH_ALEN);
+   memcpy(eth->h_source, priv->output->dev_addr, ETH_ALEN);
    memcpy(eth->h_dest, destination_mac, ETH_ALEN);
    skbc->dev = priv->output;
-   skb->priority = 1;
-   dev_queue_xmit(skbc);
+   print_hex_dump(KERN_DEBUG, "! send packet: ",
+                                        DUMP_PREFIX_OFFSET, 16, 1,
+                                        skbc->data,
+                                        skbc->len, true);
+   txq = netdev_get_tx_queue(priv->output, skb_get_queue_mapping(skbc));
+   local_irq_save(flags);
+   if (__netif_tx_trylock(txq)) {
+      if (!netif_xmit_stopped(txq))
+         err = ops->ndo_start_xmit(skbc, priv->output);
+      if (err == NETDEV_TX_OK)
+         txq_trans_update(txq);
+      __netif_tx_unlock(txq);
+   }
+   local_irq_restore(flags);
 }
 
 static rx_handler_result_t handle_frame( struct sk_buff **pskb ) {
